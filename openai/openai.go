@@ -1,27 +1,30 @@
-// openai package provides middleware for partial compatibility with the OpenAI REST API
+// openai package provides core transformation logic for partial compatibility with the OpenAI REST API
 package openai
 
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"math/rand"
+	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/types/model"
 )
 
+var finishReasonToolCalls = "tool_calls"
+
 type Error struct {
-	Message string      `json:"message"`
-	Type    string      `json:"type"`
-	Param   interface{} `json:"param"`
-	Code    *string     `json:"code"`
+	Message string  `json:"message"`
+	Type    string  `json:"type"`
+	Param   any     `json:"param"`
+	Code    *string `json:"code"`
 }
 
 type ErrorResponse struct {
@@ -29,26 +32,37 @@ type ErrorResponse struct {
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role       string     `json:"role"`
+	Content    any        `json:"content"`
+	Reasoning  string     `json:"reasoning,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Name       string     `json:"name,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+type ChoiceLogprobs struct {
+	Content []api.Logprob `json:"content"`
 }
 
 type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Message      Message         `json:"message"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
 type ChunkChoice struct {
-	Index        int     `json:"index"`
-	Delta        Message `json:"delta"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Delta        Message         `json:"delta"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
 type CompleteChunkChoice struct {
-	Text         string  `json:"text"`
-	Index        int     `json:"index"`
-	FinishReason *string `json:"finish_reason"`
+	Text         string          `json:"text"`
+	Index        int             `json:"index"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     *ChoiceLogprobs `json:"logprobs,omitempty"`
 }
 
 type Usage struct {
@@ -58,31 +72,59 @@ type Usage struct {
 }
 
 type ResponseFormat struct {
-	Type string `json:"type"`
+	Type       string      `json:"type"`
+	JsonSchema *JsonSchema `json:"json_schema,omitempty"`
+}
+
+type JsonSchema struct {
+	Schema json.RawMessage `json:"schema"`
+}
+
+type EmbedRequest struct {
+	Input          any    `json:"input"`
+	Model          string `json:"model"`
+	Dimensions     int    `json:"dimensions,omitempty"`
+	EncodingFormat string `json:"encoding_format,omitempty"` // "float" or "base64"
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type Reasoning struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ChatCompletionRequest struct {
 	Model            string          `json:"model"`
 	Messages         []Message       `json:"messages"`
 	Stream           bool            `json:"stream"`
+	StreamOptions    *StreamOptions  `json:"stream_options"`
 	MaxTokens        *int            `json:"max_tokens"`
 	Seed             *int            `json:"seed"`
 	Stop             any             `json:"stop"`
 	Temperature      *float64        `json:"temperature"`
 	FrequencyPenalty *float64        `json:"frequency_penalty"`
-	PresencePenalty  *float64        `json:"presence_penalty_penalty"`
+	PresencePenalty  *float64        `json:"presence_penalty"`
 	TopP             *float64        `json:"top_p"`
 	ResponseFormat   *ResponseFormat `json:"response_format"`
+	Tools            []api.Tool      `json:"tools"`
+	Reasoning        *Reasoning      `json:"reasoning,omitempty"`
+	ReasoningEffort  *string         `json:"reasoning_effort,omitempty"`
+	Logprobs         *bool           `json:"logprobs"`
+	TopLogprobs      int             `json:"top_logprobs"`
+	DebugRenderOnly  bool            `json:"_debug_render_only"`
 }
 
 type ChatCompletion struct {
-	Id                string   `json:"id"`
-	Object            string   `json:"object"`
-	Created           int64    `json:"created"`
-	Model             string   `json:"model"`
-	SystemFingerprint string   `json:"system_fingerprint"`
-	Choices           []Choice `json:"choices"`
-	Usage             Usage    `json:"usage,omitempty"`
+	Id                string         `json:"id"`
+	Object            string         `json:"object"`
+	Created           int64          `json:"created"`
+	Model             string         `json:"model"`
+	SystemFingerprint string         `json:"system_fingerprint"`
+	Choices           []Choice       `json:"choices"`
+	Usage             Usage          `json:"usage,omitempty"`
+	DebugInfo         *api.DebugInfo `json:"_debug_info,omitempty"`
 }
 
 type ChatCompletionChunk struct {
@@ -92,20 +134,25 @@ type ChatCompletionChunk struct {
 	Model             string        `json:"model"`
 	SystemFingerprint string        `json:"system_fingerprint"`
 	Choices           []ChunkChoice `json:"choices"`
+	Usage             *Usage        `json:"usage,omitempty"`
 }
 
 // TODO (https://github.com/ollama/ollama/issues/5259): support []string, []int and [][]int
 type CompletionRequest struct {
-	Model            string   `json:"model"`
-	Prompt           string   `json:"prompt"`
-	FrequencyPenalty float32  `json:"frequency_penalty"`
-	MaxTokens        *int     `json:"max_tokens"`
-	PresencePenalty  float32  `json:"presence_penalty"`
-	Seed             *int     `json:"seed"`
-	Stop             any      `json:"stop"`
-	Stream           bool     `json:"stream"`
-	Temperature      *float32 `json:"temperature"`
-	TopP             float32  `json:"top_p"`
+	Model            string         `json:"model"`
+	Prompt           string         `json:"prompt"`
+	FrequencyPenalty float32        `json:"frequency_penalty"`
+	MaxTokens        *int           `json:"max_tokens"`
+	PresencePenalty  float32        `json:"presence_penalty"`
+	Seed             *int           `json:"seed"`
+	Stop             any            `json:"stop"`
+	Stream           bool           `json:"stream"`
+	StreamOptions    *StreamOptions `json:"stream_options"`
+	Temperature      *float32       `json:"temperature"`
+	TopP             float32        `json:"top_p"`
+	Suffix           string         `json:"suffix"`
+	Logprobs         *int           `json:"logprobs"`
+	DebugRenderOnly  bool           `json:"_debug_render_only"`
 }
 
 type Completion struct {
@@ -125,6 +172,17 @@ type CompletionChunk struct {
 	Choices           []CompleteChunkChoice `json:"choices"`
 	Model             string                `json:"model"`
 	SystemFingerprint string                `json:"system_fingerprint"`
+	Usage             *Usage                `json:"usage,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string `json:"id"`
+	Index    int    `json:"index"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type Model struct {
@@ -134,9 +192,27 @@ type Model struct {
 	OwnedBy string `json:"owned_by"`
 }
 
+type Embedding struct {
+	Object    string `json:"object"`
+	Embedding any    `json:"embedding"` // Can be []float32 (float format) or string (base64 format)
+	Index     int    `json:"index"`
+}
+
 type ListCompletion struct {
 	Object string  `json:"object"`
 	Data   []Model `json:"data"`
+}
+
+type EmbeddingList struct {
+	Object string         `json:"object"`
+	Data   []Embedding    `json:"data"`
+	Model  string         `json:"model"`
+	Usage  EmbeddingUsage `json:"usage,omitempty"`
+}
+
+type EmbeddingUsage struct {
+	PromptTokens int `json:"prompt_tokens"`
+	TotalTokens  int `json:"total_tokens"`
 }
 
 func NewError(code int, message string) ErrorResponse {
@@ -153,7 +229,44 @@ func NewError(code int, message string) ErrorResponse {
 	return ErrorResponse{Error{Type: etype, Message: message}}
 }
 
-func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
+// ToUsage converts an api.ChatResponse to Usage
+func ToUsage(r api.ChatResponse) Usage {
+	return Usage{
+		PromptTokens:     r.Metrics.PromptEvalCount,
+		CompletionTokens: r.Metrics.EvalCount,
+		TotalTokens:      r.Metrics.PromptEvalCount + r.Metrics.EvalCount,
+	}
+}
+
+// ToToolCalls converts api.ToolCall to OpenAI ToolCall format
+func ToToolCalls(tc []api.ToolCall) []ToolCall {
+	toolCalls := make([]ToolCall, len(tc))
+	for i, tc := range tc {
+		toolCalls[i].ID = tc.ID
+		toolCalls[i].Type = "function"
+		toolCalls[i].Function.Name = tc.Function.Name
+		toolCalls[i].Index = tc.Function.Index
+
+		args, err := json.Marshal(tc.Function.Arguments)
+		if err != nil {
+			slog.Error("could not marshall function arguments to json", "error", err)
+			continue
+		}
+
+		toolCalls[i].Function.Arguments = string(args)
+	}
+	return toolCalls
+}
+
+// ToChatCompletion converts an api.ChatResponse to ChatCompletion
+func ToChatCompletion(id string, r api.ChatResponse) ChatCompletion {
+	toolCalls := ToToolCalls(r.Message.ToolCalls)
+
+	var logprobs *ChoiceLogprobs
+	if len(r.Logprobs) > 0 {
+		logprobs = &ChoiceLogprobs{Content: r.Logprobs}
+	}
+
 	return ChatCompletion{
 		Id:                id,
 		Object:            "chat.completion",
@@ -162,24 +275,31 @@ func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 		SystemFingerprint: "fp_ollama",
 		Choices: []Choice{{
 			Index:   0,
-			Message: Message{Role: r.Message.Role, Content: r.Message.Content},
+			Message: Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
 			FinishReason: func(reason string) *string {
+				if len(toolCalls) > 0 {
+					reason = "tool_calls"
+				}
 				if len(reason) > 0 {
 					return &reason
 				}
 				return nil
 			}(r.DoneReason),
-		}},
-		Usage: Usage{
-			// TODO: ollama returns 0 for prompt eval if the prompt was cached, but openai returns the actual count
-			PromptTokens:     r.PromptEvalCount,
-			CompletionTokens: r.EvalCount,
-			TotalTokens:      r.PromptEvalCount + r.EvalCount,
-		},
+			Logprobs: logprobs,
+		}}, Usage: ToUsage(r),
+		DebugInfo: r.DebugInfo,
 	}
 }
 
-func toChunk(id string, r api.ChatResponse) ChatCompletionChunk {
+// ToChunk converts an api.ChatResponse to ChatCompletionChunk
+func ToChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChunk {
+	toolCalls := ToToolCalls(r.Message.ToolCalls)
+
+	var logprobs *ChoiceLogprobs
+	if len(r.Logprobs) > 0 {
+		logprobs = &ChoiceLogprobs{Content: r.Logprobs}
+	}
+
 	return ChatCompletionChunk{
 		Id:                id,
 		Object:            "chat.completion.chunk",
@@ -188,18 +308,32 @@ func toChunk(id string, r api.ChatResponse) ChatCompletionChunk {
 		SystemFingerprint: "fp_ollama",
 		Choices: []ChunkChoice{{
 			Index: 0,
-			Delta: Message{Role: "assistant", Content: r.Message.Content},
+			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
 			FinishReason: func(reason string) *string {
 				if len(reason) > 0 {
+					if toolCallSent || len(toolCalls) > 0 {
+						return &finishReasonToolCalls
+					}
 					return &reason
 				}
 				return nil
 			}(r.DoneReason),
+			Logprobs: logprobs,
 		}},
 	}
 }
 
-func toCompletion(id string, r api.GenerateResponse) Completion {
+// ToUsageGenerate converts an api.GenerateResponse to Usage
+func ToUsageGenerate(r api.GenerateResponse) Usage {
+	return Usage{
+		PromptTokens:     r.Metrics.PromptEvalCount,
+		CompletionTokens: r.Metrics.EvalCount,
+		TotalTokens:      r.Metrics.PromptEvalCount + r.Metrics.EvalCount,
+	}
+}
+
+// ToCompletion converts an api.GenerateResponse to Completion
+func ToCompletion(id string, r api.GenerateResponse) Completion {
 	return Completion{
 		Id:                id,
 		Object:            "text_completion",
@@ -216,16 +350,12 @@ func toCompletion(id string, r api.GenerateResponse) Completion {
 				return nil
 			}(r.DoneReason),
 		}},
-		Usage: Usage{
-			// TODO: ollama returns 0 for prompt eval if the prompt was cached, but openai returns the actual count
-			PromptTokens:     r.PromptEvalCount,
-			CompletionTokens: r.EvalCount,
-			TotalTokens:      r.PromptEvalCount + r.EvalCount,
-		},
+		Usage: ToUsageGenerate(r),
 	}
 }
 
-func toCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
+// ToCompleteChunk converts an api.GenerateResponse to CompletionChunk
+func ToCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
 	return CompletionChunk{
 		Id:                id,
 		Object:            "text_completion",
@@ -245,7 +375,8 @@ func toCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
 	}
 }
 
-func toListCompletion(r api.ListResponse) ListCompletion {
+// ToListCompletion converts an api.ListResponse to ListCompletion
+func ToListCompletion(r api.ListResponse) ListCompletion {
 	var data []Model
 	for _, m := range r.Models {
 		data = append(data, Model{
@@ -262,7 +393,49 @@ func toListCompletion(r api.ListResponse) ListCompletion {
 	}
 }
 
-func toModel(r api.ShowResponse, m string) Model {
+// ToEmbeddingList converts an api.EmbedResponse to EmbeddingList
+// encodingFormat can be "float", "base64", or empty (defaults to "float")
+func ToEmbeddingList(model string, r api.EmbedResponse, encodingFormat string) EmbeddingList {
+	if r.Embeddings != nil {
+		var data []Embedding
+		for i, e := range r.Embeddings {
+			var embedding any
+			if strings.EqualFold(encodingFormat, "base64") {
+				embedding = floatsToBase64(e)
+			} else {
+				embedding = e
+			}
+
+			data = append(data, Embedding{
+				Object:    "embedding",
+				Embedding: embedding,
+				Index:     i,
+			})
+		}
+
+		return EmbeddingList{
+			Object: "list",
+			Data:   data,
+			Model:  model,
+			Usage: EmbeddingUsage{
+				PromptTokens: r.PromptEvalCount,
+				TotalTokens:  r.PromptEvalCount,
+			},
+		}
+	}
+
+	return EmbeddingList{}
+}
+
+// floatsToBase64 encodes a []float32 to a base64 string
+func floatsToBase64(floats []float32) string {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, floats)
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// ToModel converts an api.ShowResponse to Model
+func ToModel(r api.ShowResponse, m string) Model {
 	return Model{
 		Id:      m,
 		Object:  "model",
@@ -271,69 +444,86 @@ func toModel(r api.ShowResponse, m string) Model {
 	}
 }
 
-func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
+// FromChatRequest converts a ChatCompletionRequest to api.ChatRequest
+func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	var messages []api.Message
 	for _, msg := range r.Messages {
+		toolName := ""
+		if strings.ToLower(msg.Role) == "tool" {
+			toolName = msg.Name
+			if toolName == "" && msg.ToolCallID != "" {
+				toolName = nameFromToolCallID(r.Messages, msg.ToolCallID)
+			}
+		}
 		switch content := msg.Content.(type) {
 		case string:
-			messages = append(messages, api.Message{Role: msg.Role, Content: content})
+			toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, api.Message{Role: msg.Role, Content: content, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolName: toolName, ToolCallID: msg.ToolCallID})
 		case []any:
-			message := api.Message{Role: msg.Role}
 			for _, c := range content {
 				data, ok := c.(map[string]any)
 				if !ok {
-					return nil, fmt.Errorf("invalid message format")
+					return nil, errors.New("invalid message format")
 				}
 				switch data["type"] {
 				case "text":
 					text, ok := data["text"].(string)
 					if !ok {
-						return nil, fmt.Errorf("invalid message format")
+						return nil, errors.New("invalid message format")
 					}
-					message.Content = text
+					messages = append(messages, api.Message{Role: msg.Role, Content: text})
 				case "image_url":
 					var url string
 					if urlMap, ok := data["image_url"].(map[string]any); ok {
 						if url, ok = urlMap["url"].(string); !ok {
-							return nil, fmt.Errorf("invalid message format")
+							return nil, errors.New("invalid message format")
 						}
 					} else {
 						if url, ok = data["image_url"].(string); !ok {
-							return nil, fmt.Errorf("invalid message format")
+							return nil, errors.New("invalid message format")
 						}
 					}
 
-					types := []string{"jpeg", "jpg", "png"}
-					valid := false
-					for _, t := range types {
-						prefix := "data:image/" + t + ";base64,"
-						if strings.HasPrefix(url, prefix) {
-							url = strings.TrimPrefix(url, prefix)
-							valid = true
-							break
-						}
-					}
-
-					if !valid {
-						return nil, fmt.Errorf("invalid image input")
-					}
-
-					img, err := base64.StdEncoding.DecodeString(url)
+					img, err := decodeImageURL(url)
 					if err != nil {
-						return nil, fmt.Errorf("invalid message format")
+						return nil, err
 					}
-					message.Images = append(message.Images, img)
+
+					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{img}})
 				default:
-					return nil, fmt.Errorf("invalid message format")
+					return nil, errors.New("invalid message format")
 				}
 			}
-			messages = append(messages, message)
+			// since we might have added multiple messages above, if we have tools
+			// calls we'll add them to the last message
+			if len(messages) > 0 && len(msg.ToolCalls) > 0 {
+				toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
+				if err != nil {
+					return nil, err
+				}
+				messages[len(messages)-1].ToolCalls = toolCalls
+				messages[len(messages)-1].ToolName = toolName
+				messages[len(messages)-1].ToolCallID = msg.ToolCallID
+				messages[len(messages)-1].Thinking = msg.Reasoning
+			}
 		default:
-			return nil, fmt.Errorf("invalid message content type: %T", content)
+			// content is only optional if tool calls are present
+			if msg.ToolCalls == nil {
+				return nil, fmt.Errorf("invalid message content type: %T", content)
+			}
+
+			toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolCallID: msg.ToolCallID})
 		}
 	}
 
-	options := make(map[string]interface{})
+	options := make(map[string]any)
 
 	switch stop := r.Stop.(type) {
 	case string:
@@ -353,7 +543,7 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	}
 
 	if r.Temperature != nil {
-		options["temperature"] = *r.Temperature * 2.0
+		options["temperature"] = *r.Temperature
 	} else {
 		options["temperature"] = 1.0
 	}
@@ -363,11 +553,11 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	}
 
 	if r.FrequencyPenalty != nil {
-		options["frequency_penalty"] = *r.FrequencyPenalty * 2.0
+		options["frequency_penalty"] = *r.FrequencyPenalty
 	}
 
 	if r.PresencePenalty != nil {
-		options["presence_penalty"] = *r.PresencePenalty * 2.0
+		options["presence_penalty"] = *r.PresencePenalty
 	}
 
 	if r.TopP != nil {
@@ -376,21 +566,114 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		options["top_p"] = 1.0
 	}
 
-	var format string
-	if r.ResponseFormat != nil && r.ResponseFormat.Type == "json_object" {
-		format = "json"
+	var format json.RawMessage
+	if r.ResponseFormat != nil {
+		switch strings.ToLower(strings.TrimSpace(r.ResponseFormat.Type)) {
+		// Support the old "json_object" type for OpenAI compatibility
+		case "json_object":
+			format = json.RawMessage(`"json"`)
+		case "json_schema":
+			if r.ResponseFormat.JsonSchema != nil {
+				format = r.ResponseFormat.JsonSchema.Schema
+			}
+		}
+	}
+
+	var think *api.ThinkValue
+	var effort string
+
+	if r.Reasoning != nil {
+		effort = r.Reasoning.Effort
+	} else if r.ReasoningEffort != nil {
+		effort = *r.ReasoningEffort
+	}
+
+	if effort != "" {
+		if !slices.Contains([]string{"high", "medium", "low", "none"}, effort) {
+			return nil, fmt.Errorf("invalid reasoning value: '%s' (must be \"high\", \"medium\", \"low\", or \"none\")", effort)
+		}
+
+		if effort == "none" {
+			think = &api.ThinkValue{Value: false}
+		} else {
+			think = &api.ThinkValue{Value: effort}
+		}
 	}
 
 	return &api.ChatRequest{
-		Model:    r.Model,
-		Messages: messages,
-		Format:   format,
-		Options:  options,
-		Stream:   &r.Stream,
+		Model:           r.Model,
+		Messages:        messages,
+		Format:          format,
+		Options:         options,
+		Stream:          &r.Stream,
+		Tools:           r.Tools,
+		Think:           think,
+		Logprobs:        r.Logprobs != nil && *r.Logprobs,
+		TopLogprobs:     r.TopLogprobs,
+		DebugRenderOnly: r.DebugRenderOnly,
 	}, nil
 }
 
-func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
+func nameFromToolCallID(messages []Message, toolCallID string) string {
+	// iterate backwards to be more resilient to duplicate tool call IDs (this
+	// follows "last one wins")
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		for _, tc := range msg.ToolCalls {
+			if tc.ID == toolCallID {
+				return tc.Function.Name
+			}
+		}
+	}
+	return ""
+}
+
+// decodeImageURL decodes a base64 data URI into raw image bytes.
+func decodeImageURL(url string) (api.ImageData, error) {
+	types := []string{"jpeg", "jpg", "png", "webp"}
+
+	// Support blank mime type to match /api/chat's behavior of taking just unadorned base64
+	if strings.HasPrefix(url, "data:;base64,") {
+		url = strings.TrimPrefix(url, "data:;base64,")
+	} else {
+		valid := false
+		for _, t := range types {
+			prefix := "data:image/" + t + ";base64,"
+			if strings.HasPrefix(url, prefix) {
+				url = strings.TrimPrefix(url, prefix)
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return nil, errors.New("invalid image input")
+		}
+	}
+
+	img, err := base64.StdEncoding.DecodeString(url)
+	if err != nil {
+		return nil, errors.New("invalid image input")
+	}
+	return img, nil
+}
+
+// FromCompletionToolCall converts OpenAI ToolCall format to api.ToolCall
+func FromCompletionToolCall(toolCalls []ToolCall) ([]api.ToolCall, error) {
+	apiToolCalls := make([]api.ToolCall, len(toolCalls))
+	for i, tc := range toolCalls {
+		apiToolCalls[i].ID = tc.ID
+		apiToolCalls[i].Function.Name = tc.Function.Name
+		err := json.Unmarshal([]byte(tc.Function.Arguments), &apiToolCalls[i].Function.Arguments)
+		if err != nil {
+			return nil, errors.New("invalid tool call arguments")
+		}
+	}
+
+	return apiToolCalls, nil
+}
+
+// FromCompleteRequest converts a CompletionRequest to api.GenerateRequest
+func FromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 	options := make(map[string]any)
 
 	switch stop := r.Stop.(type) {
@@ -413,7 +696,7 @@ func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 	}
 
 	if r.Temperature != nil {
-		options["temperature"] = *r.Temperature * 2.0
+		options["temperature"] = *r.Temperature
 	} else {
 		options["temperature"] = 1.0
 	}
@@ -422,9 +705,9 @@ func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 		options["seed"] = *r.Seed
 	}
 
-	options["frequency_penalty"] = r.FrequencyPenalty * 2.0
+	options["frequency_penalty"] = r.FrequencyPenalty
 
-	options["presence_penalty"] = r.PresencePenalty * 2.0
+	options["presence_penalty"] = r.PresencePenalty
 
 	if r.TopP != 0.0 {
 		options["top_p"] = r.TopP
@@ -432,309 +715,21 @@ func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 		options["top_p"] = 1.0
 	}
 
+	var logprobs bool
+	var topLogprobs int
+	if r.Logprobs != nil && *r.Logprobs > 0 {
+		logprobs = true
+		topLogprobs = *r.Logprobs
+	}
+
 	return api.GenerateRequest{
-		Model:   r.Model,
-		Prompt:  r.Prompt,
-		Options: options,
-		Stream:  &r.Stream,
+		Model:           r.Model,
+		Prompt:          r.Prompt,
+		Options:         options,
+		Stream:          &r.Stream,
+		Suffix:          r.Suffix,
+		Logprobs:        logprobs,
+		TopLogprobs:     topLogprobs,
+		DebugRenderOnly: r.DebugRenderOnly,
 	}, nil
-}
-
-type BaseWriter struct {
-	gin.ResponseWriter
-}
-
-type ChatWriter struct {
-	stream bool
-	id     string
-	BaseWriter
-}
-
-type CompleteWriter struct {
-	stream bool
-	id     string
-	BaseWriter
-}
-
-type ListWriter struct {
-	BaseWriter
-}
-
-type RetrieveWriter struct {
-	BaseWriter
-	model string
-}
-
-func (w *BaseWriter) writeError(code int, data []byte) (int, error) {
-	var serr api.StatusError
-	err := json.Unmarshal(data, &serr)
-	if err != nil {
-		return 0, err
-	}
-
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(NewError(http.StatusInternalServerError, serr.Error()))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *ChatWriter) writeResponse(data []byte) (int, error) {
-	var chatResponse api.ChatResponse
-	err := json.Unmarshal(data, &chatResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	// chat chunk
-	if w.stream {
-		d, err := json.Marshal(toChunk(w.id, chatResponse))
-		if err != nil {
-			return 0, err
-		}
-
-		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-		if err != nil {
-			return 0, err
-		}
-
-		if chatResponse.Done {
-			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
-			if err != nil {
-				return 0, err
-			}
-		}
-
-		return len(data), nil
-	}
-
-	// chat completion
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toChatCompletion(w.id, chatResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *ChatWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(code, data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
-	var generateResponse api.GenerateResponse
-	err := json.Unmarshal(data, &generateResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	// completion chunk
-	if w.stream {
-		d, err := json.Marshal(toCompleteChunk(w.id, generateResponse))
-		if err != nil {
-			return 0, err
-		}
-
-		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
-		if err != nil {
-			return 0, err
-		}
-
-		if generateResponse.Done {
-			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
-			if err != nil {
-				return 0, err
-			}
-		}
-
-		return len(data), nil
-	}
-
-	// completion
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toCompletion(w.id, generateResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *CompleteWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(code, data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func (w *ListWriter) writeResponse(data []byte) (int, error) {
-	var listResponse api.ListResponse
-	err := json.Unmarshal(data, &listResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toListCompletion(listResponse))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *ListWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(code, data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func (w *RetrieveWriter) writeResponse(data []byte) (int, error) {
-	var showResponse api.ShowResponse
-	err := json.Unmarshal(data, &showResponse)
-	if err != nil {
-		return 0, err
-	}
-
-	// retrieve completion
-	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toModel(showResponse, w.model))
-	if err != nil {
-		return 0, err
-	}
-
-	return len(data), nil
-}
-
-func (w *RetrieveWriter) Write(data []byte) (int, error) {
-	code := w.ResponseWriter.Status()
-	if code != http.StatusOK {
-		return w.writeError(code, data)
-	}
-
-	return w.writeResponse(data)
-}
-
-func ListMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		w := &ListWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
-}
-
-func RetrieveMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var b bytes.Buffer
-		if err := json.NewEncoder(&b).Encode(api.ShowRequest{Name: c.Param("model")}); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewError(http.StatusInternalServerError, err.Error()))
-			return
-		}
-
-		c.Request.Body = io.NopCloser(&b)
-
-		// response writer
-		w := &RetrieveWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-			model:      c.Param("model"),
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
-}
-
-func CompletionsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req CompletionRequest
-		err := c.ShouldBindJSON(&req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		var b bytes.Buffer
-		genReq, err := fromCompleteRequest(req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		if err := json.NewEncoder(&b).Encode(genReq); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewError(http.StatusInternalServerError, err.Error()))
-			return
-		}
-
-		c.Request.Body = io.NopCloser(&b)
-
-		w := &CompleteWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-			stream:     req.Stream,
-			id:         fmt.Sprintf("cmpl-%d", rand.Intn(999)),
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
-}
-
-func ChatMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req ChatCompletionRequest
-		err := c.ShouldBindJSON(&req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-			return
-		}
-
-		if len(req.Messages) == 0 {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, "[] is too short - 'messages'"))
-			return
-		}
-
-		var b bytes.Buffer
-
-		chatReq, err := fromChatRequest(req)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, NewError(http.StatusBadRequest, err.Error()))
-		}
-
-		if err := json.NewEncoder(&b).Encode(chatReq); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, NewError(http.StatusInternalServerError, err.Error()))
-			return
-		}
-
-		c.Request.Body = io.NopCloser(&b)
-
-		w := &ChatWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-			stream:     req.Stream,
-			id:         fmt.Sprintf("chatcmpl-%d", rand.Intn(999)),
-		}
-
-		c.Writer = w
-
-		c.Next()
-	}
 }

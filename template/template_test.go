@@ -10,10 +10,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+
 	"github.com/ollama/ollama/api"
-	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/fs/ggml"
 )
 
 func TestNamed(t *testing.T) {
@@ -32,7 +34,7 @@ func TestNamed(t *testing.T) {
 
 		for k, v := range ss {
 			t.Run(k, func(t *testing.T) {
-				kv := llm.KV{"tokenizer.chat_template": v}
+				kv := ggml.KV{"tokenizer.chat_template": v}
 				s := kv.ChatTemplate()
 				r, err := Named(s)
 				if err != nil {
@@ -153,22 +155,55 @@ func TestTemplate(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-	cases := []struct {
+	validCases := []struct {
+		name     string
 		template string
 		vars     []string
 	}{
-		{"{{ .Prompt }}", []string{"prompt", "response"}},
-		{"{{ .System }} {{ .Prompt }}", []string{"prompt", "response", "system"}},
-		{"{{ .System }} {{ .Prompt }} {{ .Response }}", []string{"prompt", "response", "system"}},
-		{"{{ with .Tools }}{{ . }}{{ end }} {{ .System }} {{ .Prompt }}", []string{"prompt", "response", "system", "tools"}},
-		{"{{ range .Messages }}{{ .Role }} {{ .Content }}{{ end }}", []string{"content", "messages", "role"}},
-		{`{{- range .Messages }}
+		{
+			name:     "PromptOnly",
+			template: "{{ .Prompt }}",
+			vars:     []string{"prompt", "response"},
+		},
+		{
+			name:     "SystemAndPrompt",
+			template: "{{ .System }} {{ .Prompt }}",
+			vars:     []string{"prompt", "response", "system"},
+		},
+		{
+			name:     "PromptResponseSystem",
+			template: "{{ .System }} {{ .Prompt }} {{ .Response }}",
+			vars:     []string{"prompt", "response", "system"},
+		},
+		{
+			name:     "ToolsBlock",
+			template: "{{ with .Tools }}{{ . }}{{ end }} {{ .System }} {{ .Prompt }}",
+			vars:     []string{"prompt", "response", "system", "tools"},
+		},
+		{
+			name:     "MessagesRange",
+			template: "{{ range .Messages }}{{ .Role }} {{ .Content }}{{ end }}",
+			vars:     []string{"content", "messages", "role"},
+		},
+		{
+			name:     "ToolResultConditional",
+			template: "{{ range .Messages }}{{ if eq .Role \"tool\" }}Tool Result: {{ .ToolName }} {{ .Content }}{{ end }}{{ end }}",
+			vars:     []string{"content", "messages", "role", "toolname"},
+		},
+		{
+			name: "MultilineSystemUserAssistant",
+			template: `{{- range .Messages }}
 {{- if eq .Role "system" }}SYSTEM:
 {{- else if eq .Role "user" }}USER:
 {{- else if eq .Role "assistant" }}ASSISTANT:
+{{- else if eq .Role "tool" }}TOOL:
 {{- end }} {{ .Content }}
-{{- end }}`, []string{"content", "messages", "role"}},
-		{`{{- if .Messages }}
+{{- end }}`,
+			vars: []string{"content", "messages", "role"},
+		},
+		{
+			name: "ChatMLLike",
+			template: `{{- if .Messages }}
 {{- range .Messages }}<|im_start|>{{ .Role }}
 {{ .Content }}<|im_end|>
 {{ end }}<|im_start|>assistant
@@ -179,18 +214,59 @@ func TestParse(t *testing.T) {
 {{ .Prompt }}<|im_end|>
 {{ end }}<|im_start|>assistant
 {{ .Response }}<|im_end|>
-{{- end -}}`, []string{"content", "messages", "prompt", "response", "role", "system"}},
+{{- end -}}`,
+			vars: []string{"content", "messages", "prompt", "response", "role", "system"},
+		},
 	}
 
-	for _, tt := range cases {
-		t.Run("", func(t *testing.T) {
+	for _, tt := range validCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			tmpl, err := Parse(tt.template)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("Parse returned unexpected error: %v", err)
 			}
 
-			if diff := cmp.Diff(tmpl.Vars(), tt.vars); diff != "" {
-				t.Errorf("mismatch (-got +want):\n%s", diff)
+			gotVars, err := tmpl.Vars()
+			if err != nil {
+				t.Fatalf("Vars returned unexpected error: %v", err)
+			}
+
+			if diff := cmp.Diff(gotVars, tt.vars); diff != "" {
+				t.Errorf("Vars mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestParseError(t *testing.T) {
+	invalidCases := []struct {
+		name     string
+		template string
+		errorStr string
+	}{
+		{
+			"TemplateNotClosed",
+			"{{ .Prompt ",
+			"unclosed action",
+		},
+		{
+			"Template",
+			`{{define "x"}}{{template "x"}}{{end}}{{template "x"}}`,
+			"undefined template specified",
+		},
+	}
+
+	for _, tt := range invalidCases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.template)
+			if err == nil {
+				t.Fatalf("expected Parse to return an error for an invalid template, got nil")
+			}
+
+			if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tt.errorStr)) {
+				t.Errorf("unexpected error message.\n got: %q\n want substring (case‑insensitive): %q", err.Error(), tt.errorStr)
 			}
 		})
 	}
@@ -261,6 +337,26 @@ func TestExecuteWithMessages(t *testing.T) {
 Hello friend![/INST] Hello human![INST] What is your name?[/INST] `,
 		},
 		{
+			"mistral assistant",
+			[]template{
+				{"no response", `[INST] {{ .Prompt }}[/INST] `},
+				{"response", `[INST] {{ .Prompt }}[/INST] {{ .Response }}`},
+				{"messages", `
+{{- range $i, $m := .Messages }}
+{{- if eq .Role "user" }}[INST] {{ .Content }}[/INST] {{ else if eq .Role "assistant" }}{{ .Content }}{{ end }}
+{{- end }}`},
+			},
+			Values{
+				Messages: []api.Message{
+					{Role: "user", Content: "Hello friend!"},
+					{Role: "assistant", Content: "Hello human!"},
+					{Role: "user", Content: "What is your name?"},
+					{Role: "assistant", Content: "My name is Ollama and I"},
+				},
+			},
+			`[INST] Hello friend![/INST] Hello human![INST] What is your name?[/INST] My name is Ollama and I`,
+		},
+		{
 			"chatml",
 			[]template{
 				// this does not have a "no response" test because it's impossible to render the same output
@@ -296,45 +392,6 @@ What is your name?<|im_end|>
 <|im_start|>assistant
 `,
 		},
-		{
-			"moondream",
-			[]template{
-				// this does not have a "no response" test because it's impossible to render the same output
-				{"response", `{{ if .Prompt }}Question: {{ .Prompt }}
-
-{{ end }}Answer: {{ .Response }}
-
-`},
-				{"messages", `
-{{- range .Messages }}
-{{- if eq .Role "user" }}Question: {{ .Content }}
-
-{{ else if eq .Role "assistant" }}Answer: {{ .Content }}
-
-{{ end }}
-{{- end }}Answer: `},
-			},
-			Values{
-				Messages: []api.Message{
-					{Role: "user", Content: "What's in this image?", Images: []api.ImageData{[]byte("")}},
-					{Role: "assistant", Content: "It's a hot dog."},
-					{Role: "user", Content: "What's in _this_ image?"},
-					{Role: "user", Images: []api.ImageData{[]byte("")}},
-					{Role: "user", Content: "Is it a hot dog?"},
-				},
-			},
-			`Question: [img-0] What's in this image?
-
-Answer: It's a hot dog.
-
-Question: What's in _this_ image?
-
-[img-1]
-
-Is it a hot dog?
-
-Answer: `,
-		},
 	}
 
 	for _, tt := range cases {
@@ -355,6 +412,203 @@ Answer: `,
 						t.Errorf("mismatch (-got +want):\n%s", diff)
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestExecuteWithSuffix(t *testing.T) {
+	tmpl, err := Parse(`{{- if .Suffix }}<PRE> {{ .Prompt }} <SUF>{{ .Suffix }} <MID>
+{{- else }}{{ .Prompt }}
+{{- end }}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		values Values
+		expect string
+	}{
+		{
+			"message", Values{Messages: []api.Message{{Role: "user", Content: "hello"}}}, "hello",
+		},
+		{
+			"prompt suffix", Values{Prompt: "def add(", Suffix: "return x"}, "<PRE> def add( <SUF>return x <MID>",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var b bytes.Buffer
+			if err := tmpl.Execute(&b, tt.values); err != nil {
+				t.Fatal(err)
+			}
+
+			if diff := cmp.Diff(b.String(), tt.expect); diff != "" {
+				t.Errorf("mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestDateFunctions(t *testing.T) {
+	t.Run("currentDate", func(t *testing.T) {
+		tmpl, err := Parse("{{- range .Messages }}{{ .Content }}{{ end }} Today is {{ currentDate }}")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var b bytes.Buffer
+		if err := tmpl.Execute(&b, Values{Messages: []api.Message{{Role: "user", Content: "Hello"}}}); err != nil {
+			t.Fatal(err)
+		}
+
+		expected := "Hello Today is " + time.Now().Format("2006-01-02")
+		if b.String() != expected {
+			t.Errorf("got %q, want %q", b.String(), expected)
+		}
+	})
+
+	t.Run("yesterdayDate", func(t *testing.T) {
+		tmpl, err := Parse("{{- range .Messages }}{{ .Content }}{{ end }} Yesterday was {{ yesterdayDate }}")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var b bytes.Buffer
+		if err := tmpl.Execute(&b, Values{Messages: []api.Message{{Role: "user", Content: "Hello"}}}); err != nil {
+			t.Fatal(err)
+		}
+
+		expected := "Hello Yesterday was " + time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+		if b.String() != expected {
+			t.Errorf("got %q, want %q", b.String(), expected)
+		}
+	})
+
+	t.Run("yesterdayDate format", func(t *testing.T) {
+		tmpl, err := Parse("{{- range .Messages }}{{ end }}{{ yesterdayDate }}")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var b bytes.Buffer
+		if err := tmpl.Execute(&b, Values{Messages: []api.Message{{Role: "user", Content: "Hello"}}}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify the format matches YYYY-MM-DD
+		result := b.String()
+		if len(result) != 10 {
+			t.Errorf("expected date length 10, got %d: %q", len(result), result)
+		}
+
+		// Parse and verify it's a valid date
+		parsed, err := time.Parse("2006-01-02", result)
+		if err != nil {
+			t.Errorf("failed to parse date %q: %v", result, err)
+		}
+
+		// Verify it's yesterday
+		yesterday := time.Now().AddDate(0, 0, -1)
+		if parsed.Year() != yesterday.Year() || parsed.Month() != yesterday.Month() || parsed.Day() != yesterday.Day() {
+			t.Errorf("expected yesterday's date, got %v", parsed)
+		}
+	})
+}
+
+func TestCollate(t *testing.T) {
+	cases := []struct {
+		name     string
+		msgs     []api.Message
+		expected []*api.Message
+		system   string
+	}{
+		{
+			name: "consecutive user messages are merged",
+			msgs: []api.Message{
+				{Role: "user", Content: "Hello"},
+				{Role: "user", Content: "How are you?"},
+			},
+			expected: []*api.Message{
+				{Role: "user", Content: "Hello\n\nHow are you?"},
+			},
+			system: "",
+		},
+		{
+			name: "consecutive tool messages are NOT merged",
+			msgs: []api.Message{
+				{Role: "tool", Content: "sunny", ToolName: "get_weather"},
+				{Role: "tool", Content: "72F", ToolName: "get_temperature"},
+			},
+			expected: []*api.Message{
+				{Role: "tool", Content: "sunny", ToolName: "get_weather"},
+				{Role: "tool", Content: "72F", ToolName: "get_temperature"},
+			},
+			system: "",
+		},
+		{
+			name: "tool messages preserve all fields",
+			msgs: []api.Message{
+				{Role: "user", Content: "What's the weather?"},
+				{Role: "tool", Content: "sunny", ToolName: "get_conditions"},
+				{Role: "tool", Content: "72F", ToolName: "get_temperature"},
+			},
+			expected: []*api.Message{
+				{Role: "user", Content: "What's the weather?"},
+				{Role: "tool", Content: "sunny", ToolName: "get_conditions"},
+				{Role: "tool", Content: "72F", ToolName: "get_temperature"},
+			},
+			system: "",
+		},
+		{
+			name: "mixed messages with system",
+			msgs: []api.Message{
+				{Role: "system", Content: "You are helpful"},
+				{Role: "user", Content: "Hello"},
+				{Role: "assistant", Content: "Hi there!"},
+				{Role: "user", Content: "What's the weather?"},
+				{Role: "tool", Content: "sunny", ToolName: "get_weather"},
+				{Role: "tool", Content: "72F", ToolName: "get_temperature"},
+				{Role: "user", Content: "Thanks"},
+			},
+			expected: []*api.Message{
+				{Role: "system", Content: "You are helpful"},
+				{Role: "user", Content: "Hello"},
+				{Role: "assistant", Content: "Hi there!"},
+				{Role: "user", Content: "What's the weather?"},
+				{Role: "tool", Content: "sunny", ToolName: "get_weather"},
+				{Role: "tool", Content: "72F", ToolName: "get_temperature"},
+				{Role: "user", Content: "Thanks"},
+			},
+			system: "You are helpful",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			system, collated := collate(tt.msgs)
+			if diff := cmp.Diff(system, tt.system); diff != "" {
+				t.Errorf("system mismatch (-got +want):\n%s", diff)
+			}
+
+			// Compare the messages
+			if len(collated) != len(tt.expected) {
+				t.Errorf("expected %d messages, got %d", len(tt.expected), len(collated))
+				return
+			}
+
+			for i := range collated {
+				if collated[i].Role != tt.expected[i].Role {
+					t.Errorf("message %d role mismatch: got %q, want %q", i, collated[i].Role, tt.expected[i].Role)
+				}
+				if collated[i].Content != tt.expected[i].Content {
+					t.Errorf("message %d content mismatch: got %q, want %q", i, collated[i].Content, tt.expected[i].Content)
+				}
+				if collated[i].ToolName != tt.expected[i].ToolName {
+					t.Errorf("message %d tool name mismatch: got %q, want %q", i, collated[i].ToolName, tt.expected[i].ToolName)
+				}
 			}
 		})
 	}

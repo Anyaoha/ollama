@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,21 +18,13 @@ import (
 
 const defaultPrivateKey = "id_ed25519"
 
-func keyPath() (string, error) {
+func GetPublicKey() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 
-	return filepath.Join(home, ".ollama", defaultPrivateKey), nil
-}
-
-func GetPublicKey() (string, error) {
-	keyPath, err := keyPath()
-	if err != nil {
-		return "", err
-	}
-
+	keyPath := filepath.Join(home, ".ollama", defaultPrivateKey)
 	privateKeyFile, err := os.ReadFile(keyPath)
 	if err != nil {
 		slog.Info(fmt.Sprintf("Failed to load private key: %v", err))
@@ -58,11 +51,12 @@ func NewNonce(r io.Reader, length int) (string, error) {
 }
 
 func Sign(ctx context.Context, bts []byte) (string, error) {
-	keyPath, err := keyPath()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 
+	keyPath := filepath.Join(home, ".ollama", defaultPrivateKey)
 	privateKeyFile, err := os.ReadFile(keyPath)
 	if err != nil {
 		slog.Info(fmt.Sprintf("Failed to load private key: %v", err))
@@ -78,7 +72,7 @@ func Sign(ctx context.Context, bts []byte) (string, error) {
 	publicKey := ssh.MarshalAuthorizedKey(privateKey.PublicKey())
 	parts := bytes.Split(publicKey, []byte(" "))
 	if len(parts) < 2 {
-		return "", fmt.Errorf("malformed public key")
+		return "", errors.New("malformed public key")
 	}
 
 	signedData, err := privateKey.Sign(rand.Reader, bts)
